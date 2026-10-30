@@ -1,0 +1,1458 @@
+﻿
+===== jarvis\plugins\web_tools.py =====
+"""Web search + fetch â€” JARVIS OS edition.
+
+Tools return *structured JSON strings* prefixed with `__JARVIS_MEDIA__` so the
+orchestrator's emit-hook can lift them into a `media` event for the Media Bay.
+
+Providers:
+  duckduckgo  â€” no key needed (default)
+  brave       â€” BRAVE_API_KEY
+  tavily      â€” TAVILY_API_KEY
+  serpapi     â€” SERPAPI_API_KEY
+"""
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote, urlparse
+
+import httpx
+
+from ..core.permissions import Permission
+from .base import PluginInfo, tool
+
+MEDIA_PREFIX = "__JARVIS_MEDIA__"
+
+
+def _media(kind: str, items: list[dict], summary: str = "") -> str:
+    """Encode a media payload that the orchestrator emit-hook will pluck out."""
+    payload = {"kind": kind, "items": items, "summary": summary}
+    return MEDIA_PREFIX + json.dumps(payload, ensure_ascii=False)
+
+
+def register(registry):
+    cfg = registry.cfg
+    toggle = cfg.plugins.get("web_tools")
+    provider = (toggle.provider if toggle else None) or "duckduckgo"
+
+    @tool(
+        name="web_search",
+        description=(
+            "Search the web for fresh facts, news, docs, or any text-based query. "
+            "Results are rendered as clickable cards in the Media Bay AUTOMATICALLY. "
+            "Always call this before answering questions about current events, "
+            "products, people, prices, releases, or anything time-sensitive."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 6},
+            },
+            "required": ["query"],
+        },
+        preview=lambda a: f"web search: {a.get('query','')}",
+    )
+    async def web_search(query: str, max_results: int = 6) -> str:
+        # Route news-y queries into a dedicated news kind so the UI can
+        # surface them in their own NEWS panel separate from generic web
+        # results. Falls back to plain web search if Google News empty.
+        is_news = _is_news_query(query)
+        try:
+            items: list[dict] = []
+            if is_news:
+                items = await _google_news(query, max_results)
+            if not items:
+                items = await _do_search(provider, query, max_results)
+                is_news = False  # fell back to web â€” render as search
+        except Exception as e:  # noqa: BLE001
+            return f"web search failed ({provider}): {e}"
+        if not items:
+            return f"web search ({provider}): no results for '{query}'"
+        # Plain text fallback (for the model's tool-loop)
+        text_lines = [f"Found {len(items)} results for '{query}':"]
+        for i, r in enumerate(items, 1):
+            text_lines.append(f"{i}. {r.get('title','(no title)')} â€” {r.get('url','')}")
+            if r.get("snippet"):
+                text_lines.append(f"   {r['snippet']}")
+        return _media("news" if is_news else "search", items, "\n".join(text_lines))
+
+    @tool(
+        name="image_search",
+        description=(
+            "Search the web for IMAGES. Results render as a thumbnail grid in the "
+            "Media Bay; click to view full size. Use whenever the user asks for "
+            "pictures, photos, logos, diagrams, screenshots, or anything visual."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 12},
+            },
+            "required": ["query"],
+        },
+        preview=lambda a: f"image search: {a.get('query','')}",
+    )
+    async def image_search(query: str, max_results: int = 12) -> str:
+        try:
+            items = await _ddg_images(query, max_results)
+        except Exception as e:  # noqa: BLE001
+            return f"image search failed: {e}"
+        if not items:
+            return f"image search: no results for '{query}'"
+        return _media("images", items, f"{len(items)} images for '{query}'")
+
+    @tool(
+        name="video_search",
+        description=(
+            "Search YouTube for VIDEOS. Results render as embedded players in the "
+            "Media Bay â€” playable inline without leaving JARVIS. Use for tutorials, "
+            "trailers, music, lectures, or any 'show me a video of X' request."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 6},
+            },
+            "required": ["query"],
+        },
+        preview=lambda a: f"video search: {a.get('query','')}",
+    )
+    async def video_search(query: str, max_results: int = 6) -> str:
+        try:
+            items = await _yt_search(query, max_results)
+        except Exception as e:  # noqa: BLE001
+            return f"video search failed: {e}"
+        if not items:
+            return f"video search: no results for '{query}'"
+        return _media("videos", items, f"{len(items)} videos for '{query}'")
+
+    @tool(
+        name="open_inline",
+        description=(
+            "Embed a web page directly inside the Media Bay iframe â€” never opens a "
+            "real browser window. Pass an absolute URL. Use whenever the user says "
+            "'open / show me / pull up <site>'."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "url":   {"type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["url"],
+        },
+        preview=lambda a: f"embed inline: {a.get('url','')}",
+    )
+    async def open_inline(url: str, title: str = "") -> str:
+        u = url.strip()
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        item = {
+            "url": u,
+            "title": title or _host(u),
+            "thumbnail": _favicon(u),
+        }
+        return _media("page", [item], f"Embedded: {item['title']}")
+
+    @tool(
+        name="media_show",
+        description=(
+            "Push an arbitrary media card (image / video / link / page) to the "
+            "Media Bay. Useful for surfacing a single result without searching."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind":      {"type": "string", "enum": ["image", "video", "page", "search"]},
+                "url":       {"type": "string"},
+                "title":     {"type": "string"},
+                "snippet":   {"type": "string"},
+                "thumbnail": {"type": "string"},
+            },
+            "required": ["kind", "url"],
+        },
+        preview=lambda a: f"media_show: {a.get('kind','')} {a.get('url','')[:60]}",
+    )
+    async def media_show(kind: str, url: str, title: str = "", snippet: str = "", thumbnail: str = "") -> str:
+        item = {"url": url, "title": title or _host(url), "snippet": snippet, "thumbnail": thumbnail or _favicon(url)}
+        return _media(kind, [item], f"Surfaced: {item['title']}")
+
+    @tool(
+        name="webcam_show",
+        description=(
+            "â˜… PREFERRED for any 'see / look / view / show me / I want to show "
+            "you' webcam intent. Opens the LIVE webcam feed inline in the Media "
+            "Bay with HUD overlay. Phrases that trigger this tool: "
+            "'look at what I'm holding', 'can you see me?', 'show me on camera', "
+            "'open the webcam', 'turn on the camera', 'take a look', "
+            "'I want you to see this', 'mirror me'. "
+            "Do NOT call `webcam_snapshot` for these â€” that is a silent "
+            "background capture, not a viewer."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "title":  {"type": "string"},
+                "mirror": {"type": "boolean", "default": True},
+            },
+        },
+        preview=lambda a: "webcam_show (live feed)",
+    )
+    async def webcam_show(title: str = "WEBCAM FEED", mirror: bool = True) -> str:
+        item = {
+            "url": "webcam://local",
+            "title": title,
+            "snippet": "Live feed from primary capture device.",
+            "thumbnail": "",
+        }
+        # Pass an extra `mirror` flag through the item so the UI can read it.
+        item["mirror"] = "1" if mirror else "0"  # type: ignore[assignment]
+        return _media("webcam", [item], f"Webcam opened: {title}")
+
+    @tool(
+        name="web_fetch",
+        description="Fetch a URL and return its readable text content (HTML stripped).",
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "url":       {"type": "string"},
+                "max_chars": {"type": "integer", "default": 8000},
+            },
+            "required": ["url"],
+        },
+        preview=lambda a: f"GET {a.get('url','')}",
+    )
+    async def web_fetch(url: str, max_chars: int = 8000) -> str:
+        # Use a realistic browser UA + standard accept headers. Many sites
+        # (Cloudflare, Akamai, etc.) 403 anything that smells like a bot.
+[Additional lines omitted]
+
+===== jarvis\agents\research.py =====
+from .base import Agent
+
+
+class ResearchAgent(Agent):
+    def __init__(self) -> None:
+        super().__init__(
+            name="research",
+            description="Searches and summarises web sources.",
+            system_prompt=(
+                "You are the RESEARCH agent. Prefer web_search then web_fetch "
+                "to read promising pages. Quote sources with their URL. "
+                "Summarise findings in tight bullets. Never invent URLs."
+            ),
+            tool_allowlist=["web_search", "web_fetch", "remember", "add_note", "search_memory"],
+        )
+
+===== jarvis\core\intent_router.py =====
+"""Deterministic intent router.
+
+Sits between the user's raw utterance and the LLM. Catches high-confidence
+intents (web search, image search, video search, open URL, create folder,
+system status, run shell, â€¦) and dispatches them as direct tool calls.
+
+Why this exists
+---------------
+The LLM is excellent at reasoning over ambiguous prompts but unreliable at
+*picking the right tool* between near-synonyms ("browser_open" vs
+"web_search"). Real-world example: "populate the latest news on Elon Musk"
+should always populate the Media Bay via `web_search`, never spawn a
+visible browser via `browser_open`. The router enforces this contract
+deterministically â€” the LLM is only invoked when no high-confidence
+intent matches.
+
+Architecture
+------------
+- `Intent` dataclass holds a name, pattern, builder, and final-reply
+  prefix. Builders take the regex match and return a `ToolCall` plus the
+  human-readable wrap-up the assistant will speak after the tool runs.
+- Intents are ordered by precedence (most specific first). The first
+  match wins.
+- Each match is logged through `jarvis.intent` for diagnostics; the
+  orchestrator can also surface this to the UI as an INFO event.
+
+Adding a new intent
+-------------------
+1. Register an `Intent(...)` in INTENTS, ideally above any broader rule
+   that might steal its trigger.
+2. If the intent maps to a new tool, add it to the plugin registry first.
+3. Add a fixture under `tests/intent_router_test.py` (todo: scaffold).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Pattern
+
+from .brain import ToolCall
+
+log = logging.getLogger("jarvis.intent")
+
+
+@dataclass(frozen=True)
+class IntentMatch:
+    """Result of intent routing."""
+    name: str                     # intent name (for logs / UI surfaces)
+    tool_call: ToolCall           # tool + arguments to dispatch
+    final_prefix: str             # what the assistant says after the tool returns
+    raw_match: str = ""           # the substring that triggered the match
+
+
+@dataclass(frozen=True)
+class Intent:
+    name: str
+    pattern: Pattern[str]
+    builder: Callable[[re.Match], IntentMatch | None]
+    description: str = ""
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _desktop_path() -> Path:
+    return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+
+
+def _clean_query(q: str) -> str:
+    """Strip filler phrasing so the search engine sees a clean query."""
+    q = (q or "").strip().strip(" .!?\"'")
+    # Strip leading verbs and articles that aren't part of the query.
+    q = re.sub(
+        r"^(?:please|kindly|could\s+you|can\s+you|would\s+you|just|simply|then)\s+",
+        "", q, flags=re.IGNORECASE,
+    )
+    q = re.sub(
+        r"^(?:about|for|on|regarding|concerning|some|any|the)\s+",
+        "", q, flags=re.IGNORECASE,
+    )
+    return q.strip()
+
+
+def _looks_like_url(target: str) -> bool:
+    t = (target or "").strip().lower()
+    if not t:
+        return False
+    if t.startswith(("http://", "https://", "www.")):
+        return True
+    # Bare host like "anthropic.com" â€” only treat as URL if it has no spaces
+    # AND has a dot AND has no question words.
+    if "." in t and " " not in t and not re.search(r"\b(?:what|who|when|where|why|how|is|are|the)\b", t):
+        return True
+    # Well-known site shortcuts.
+    return t in {"google", "youtube", "github", "stackoverflow", "duckduckgo", "twitter", "x", "reddit"}
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ pattern catalogue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Order matters: more specific patterns first.
+
+# === Media / search intents (priority over browser_open) ===
+
+# 1) Image search â€” must come BEFORE generic web search.
+_IMAGE_SEARCH_RE = re.compile(
+    r"\b(?:"
+    r"show\s+(?:me\s+)?(?:some\s+|a\s+few\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"find\s+(?:me\s+)?(?:some\s+|a\s+few\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"search\s+(?:for\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"pull\s+up\s+(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"(?:get|grab|fetch)\s+(?:me\s+)?(?:some\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"(?:image|picture|photo)\s+search\s+(?:for|of)|"
+    r"image\s+results?\s+(?:for|of)"
+    r")\s+(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_image_search(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="image_search",
+        tool_call=ToolCall("image_search", {"query": q, "max_results": 12}),
+        final_prefix=f"Image grid for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 2) Video search.
+_VIDEO_SEARCH_RE = re.compile(
+    r"\b(?:"
+    r"(?:show|find|play|get|grab|queue|pull\s+up|bring\s+up|look\s+up)\s+(?:me\s+)?(?:a\s+|some\s+)?(?:video|videos|clip|clips|footage)\s+(?:of|for|about|on)|"
+    r"search\s+(?:youtube|yt)\s+(?:for\s+)?|"
+    r"youtube\s+(?:search\s+)?(?:for|of)|"
+    r"(?:video|youtube)\s+results?\s+(?:for|of)"
+    r")\s+(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_video_search(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="video_search",
+        tool_call=ToolCall("video_search", {"query": q, "max_results": 8}),
+        final_prefix=f"Video results for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 3) Web search â€” broad. Includes "news/latest/headlines/populate/find/look up
+#    /search/google/research". This is the CRITICAL rule that prevents the
+#    regression where "populate latest news on X" opened a browser instead.
+#
+# Design rule: each alternative ends at a *keyword boundary*, not on
+# whitespace. The outer `\s*(?P<q>.+)` absorbs any separator between the
+# trigger and the query payload. This avoids the trap where a trailing
+# `\s+` in an alternative + outer `\s+` together demanded TWO whitespaces.
+# Each trigger must be followed by whitespace (lookahead `(?=\s)`) so that
+# random text like "google.com" or "https://news.ycombinator.com" never
+# fires the web-search intent â€” those belong to `open_browser`.
+_WEB_SEARCH_RE = re.compile(
+    r"\b(?:"
+    # explicit search verbs
+    r"search(?:\s+online|\s+the\s+web|\s+google)?(?:\s+for)?(?=\s)|"
+    r"google(?:\s+for)?(?=\s)|"
+    r"look\s+up(?:\s+online)?(?=\s)|"
+    r"find(?:\s+me)?(?:\s+online)?(?:\s+(?:articles?|info|information|results?))?(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    # "list available jobs in cairo" / "show me a list of restaurants" â€” lookahead
+    # keeps the web-noun in the query and blocks filesystem-intent collisions.
+    r"(?:list|show\s+me\s+a\s+list\s+of)\s+(?:[a-z]+\s+){0,3}?(?=(?:jobs?|vacancies|openings|listings?|restaurants?|hotels?|flights?|events?|places?|gyms?|cafes?|bars?|shops?|stores?|attractions?|activities|things\s+to\s+do)\b)|"
+    # populate / pull up / show me + (latest)? news/results/etc + topic
+    r"populate(?:\s+(?:the|my))?(?:\s+media\s+bay\s+with)?(?:\s+(?:latest|recent))?\s+(?:news|results|articles?|info|stories)(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    r"pull\s+up(?:\s+(?:the|some))?(?:\s+(?:latest|recent))?\s+(?:news|results|articles?|info|stories)(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    r"show\s+me(?:\s+(?:the|some))?(?:\s+(?:latest|recent))?\s+(?:news|results|articles?|info|stories|headlines)(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    # "what's the latest on X" / "whats happening with X" / "what is happening with X"
+    r"what(?:'s|s|\s+is)(?:\s+the)?\s+(?:latest|new|happening|going\s+on)(?:\s+(?:with|about|on|for|in))?(?=\s)|"
+    # "research X" / "do research on X"
+    r"(?:do\s+|some\s+)?research(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    # bare "news/headlines about X" â€” last resort, requires trailing whitespace
+    r"(?:(?:latest|recent|today's|todays)\s+)?(?:news|headlines)(?:\s+(?:on|about|for|regarding))?(?=\s)"
+    r")\s*(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_web_search(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="web_search",
+        tool_call=ToolCall("web_search", {"query": q, "max_results": 8}),
+        final_prefix=f"Search complete for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 3b) Bare "latest news" â€” no topic. The topic'd web_search above requires a
+# query after "news", so "pull up the latest news" / "show me the news" (clause
+# end) fall through. End-anchored so a topic'd request ("...news on cairo")
+# never matches here. Maps to a general headline search.
+_NEWS_BARE_RE = re.compile(
+    r"\b(?:"
+    r"(?:populate|pull\s+up|show(?:\s+me)?|get|grab|give\s+me|bring\s+up|fetch|open)"
+    r"(?:\s+(?:the|some|me))?(?:\s+(?:latest|recent|today'?s))?\s+(?:news|headlines)"
+    r"|what(?:'s|s|\s+is)(?:\s+the)?\s+(?:latest\s+)?news"
+    r"|(?:the\s+)?(?:latest|recent|today'?s)\s+(?:news|headlines)"
+    r")\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _build_news_bare(m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="web_search",
+        tool_call=ToolCall("web_search", {"query": "latest news today", "max_results": 8}),
+        final_prefix="The latest headlines are in the Media Bay, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 4) Embed a known URL inline (Media Bay iframe). Triggers on
+#    "open inline / embed / pull up <URL>".
+_OPEN_INLINE_RE = re.compile(
+    r"\b(?:"
+    r"(?:open|pull\s+up|embed|preview|show)\s+(?:inline|in\s+the\s+media\s+bay|in\s+media\s+bay|in\s+app)\s+(?P<u>\S+)|"
+    r"embed\s+(?P<u2>\S+)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _build_open_inline(m: re.Match) -> IntentMatch | None:
+    u = (m.group("u") or m.group("u2") or "").strip()
+[Additional lines omitted]
+
+===== jarvis\core\brain.py =====
+"""LLM brain.
+
+Supports two providers, both via httpx:
+  - "anthropic"           : POST <endpoint>/v1/messages
+  - "openai_compatible"   : POST <endpoint>/chat/completions   (LM Studio, Ollama, vLLM, OpenAI)
+
+Two tool-calling strategies:
+  - native_tool_calls=True  : use the provider's tool / function-calling API
+  - native_tool_calls=False : ReAct-style XML tags in plain text (works with any model)
+
+The orchestrator does NOT see the difference â€” both paths return a list of
+`ToolCall` objects (possibly empty) plus a final text reply.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Callable
+
+import httpx
+
+from ..config import Config
+
+log = logging.getLogger("jarvis.brain")
+
+
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+XML_TOOL_RE = re.compile(
+    r"<(?P<name>[a-zA-Z_][\w-]*)>\s*(?P<body>.*?)\s*</(?P=name)>",
+    re.DOTALL,
+)
+THOUGHT_RE = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
+
+
+@dataclass
+class ToolCall:
+    name: str
+    args: dict[str, Any]
+    raw: str = ""              # original text (for logging)
+    call_id: str | None = None # provider id when native
+
+
+@dataclass
+class BrainReply:
+    text: str                       # cleaned final text (no tool tags)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    raw: str = ""                   # untouched assistant message
+    finish_reason: str | None = None
+
+
+REACT_INSTRUCTIONS = """\
+You have access to tools. To call a tool, output a single block:
+
+<tool_call>
+{"name": "<tool_name>", "args": {<json-args>}}
+</tool_call>
+
+Never invent tags like <web_search> or <shell_command>. The only valid tool
+syntax is the JSON <tool_call> block above.
+
+After you receive the tool result (as a user message), you may call another
+tool or write a final reply to the user. Do NOT wrap your final reply in
+<tool_call>. Only emit one tool_call per turn. Think briefly inside
+<thinking>...</thinking> if you need to plan; that block will be hidden
+from the user. Keep replies short and concrete.
+"""
+
+
+class LLMBrain:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.mc = cfg.model
+        self._client = httpx.AsyncClient(timeout=self.mc.request_timeout_seconds)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # ------------------------------------------------------------------
+    def build_system_prompt(self, persona: str, tools_doc: str) -> str:
+        parts = [persona.strip()]
+        if not self.mc.native_tool_calls:
+            parts.append(REACT_INSTRUCTIONS)
+        if tools_doc:
+            parts.append("Available tools:\n" + tools_doc)
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        tool_schemas: list[dict] | None = None,
+    ) -> BrainReply:
+        provider = self.mc.provider
+        if provider == "anthropic":
+            return await self._chat_anthropic(messages, tool_schemas or [])
+        return await self._chat_openai_compatible(messages, tool_schemas or [])
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        tool_schemas: list[dict] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> BrainReply:
+        """Streaming chat â€” invokes `on_delta(text_chunk)` for each token.
+
+        Tool-call arguments are accumulated transparently. Returns the same
+        `BrainReply` shape as `chat()` once the stream finishes.
+
+        Falls back to non-stream on Anthropic provider or when the server
+        returns a non-stream response.
+        """
+        if self.mc.provider == "anthropic":
+            # Anthropic streaming wired separately; non-stream path still works.
+            return await self._chat_anthropic(messages, tool_schemas or [])
+        return await self._chat_openai_compatible_stream(messages, tool_schemas or [], on_delta)
+
+    # ------------------------------------------------------------------
+    async def _chat_openai_compatible(
+        self,
+        messages: list[dict[str, str]],
+        tool_schemas: list[dict],
+    ) -> BrainReply:
+        url = self.mc.endpoint.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.mc.api_key:
+            headers["Authorization"] = f"Bearer {self.mc.api_key}"
+        # OpenRouter requires these headers for proper routing.
+        if "openrouter.ai" in self.mc.endpoint:
+            headers["HTTP-Referer"] = "http://localhost:7341"
+            headers["X-Title"] = "JARVIS_LOCAL"
+
+        norm_msgs = _normalise_messages(messages)
+
+        payload: dict[str, Any] = {
+            "model": self.mc.model,
+            "messages": norm_msgs,
+            "temperature": self.mc.temperature,
+            "max_tokens": self.mc.max_tokens,
+            "stream": False,
+            "frequency_penalty": self.mc.frequency_penalty,
+            "presence_penalty":  self.mc.presence_penalty,
+        }
+        if self.mc.reasoning_effort not in (None, "none", ""):
+            payload["reasoning_effort"] = self.mc.reasoning_effort
+        if self.mc.native_tool_calls and tool_schemas:
+            payload["tools"] = [
+                {"type": "function", "function": s} for s in tool_schemas
+            ]
+
+        try:
+            resp = await self._client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:500] if e.response else ""
+            log.error("LLM HTTP %s: %s â€” %s", e.response.status_code, e, body)
+            return BrainReply(text=f"[brain error] HTTP {e.response.status_code}: {body}", raw=str(e))
+        except httpx.HTTPError as e:
+            log.error("LLM HTTP error: %s", e)
+            return BrainReply(text=f"[brain error] {e}", raw=str(e))
+
+        data = resp.json()
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message", {}) or {}
+        raw_text: str = msg.get("content") or ""
+        finish = choice.get("finish_reason")
+
+        tool_calls: list[ToolCall] = []
+
+        # native tool calls (OpenAI style)
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            tool_calls.append(
+                ToolCall(
+                    name=fn.get("name", ""),
+                    args=args,
+                    raw=json.dumps(fn),
+                    call_id=tc.get("id"),
+                )
+            )
+
+        # ReAct fallback parse
+        if not tool_calls:
+            tool_calls = _parse_react_tool_calls(raw_text)
+
+        clean_text = _strip_artifacts(raw_text)
+        return BrainReply(text=clean_text, tool_calls=tool_calls, raw=raw_text, finish_reason=finish)
+
+    # ------------------------------------------------------------------
+    async def _chat_openai_compatible_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> BrainReply:
+        url = self.mc.endpoint.rstrip("/") + "/chat/completions"
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if self.mc.api_key:
+            headers["Authorization"] = f"Bearer {self.mc.api_key}"
+        if "openrouter.ai" in self.mc.endpoint:
+            headers["HTTP-Referer"] = "http://localhost:7341"
+            headers["X-Title"] = "JARVIS_LOCAL"
+
+        norm_msgs = _normalise_messages(messages)
+        payload: dict[str, Any] = {
+            "model": self.mc.model,
+            "messages": norm_msgs,
+            "temperature": self.mc.temperature,
+            "max_tokens": self.mc.max_tokens,
+            "stream": True,
+            "frequency_penalty": self.mc.frequency_penalty,
+            "presence_penalty":  self.mc.presence_penalty,
+        }
+        if self.mc.reasoning_effort not in (None, "none", ""):
+            payload["reasoning_effort"] = self.mc.reasoning_effort
+        if self.mc.native_tool_calls and tool_schemas:
+            payload["tools"] = [{"type": "function", "function": s} for s in tool_schemas]
+
+        text_parts: list[str] = []
+        # Accumulate streaming tool_calls keyed by index.
+        tc_acc: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        loop_truncated = False
+
+        try:
+            async with self._client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", "replace")[:500]
+                    log.error("LLM stream HTTP %s: %s", resp.status_code, body)
+                    return BrainReply(text=f"[brain error] HTTP {resp.status_code}: {body}", raw=body)
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+[Additional lines omitted]
+
+===== jarvis\core\pc_control.py =====
+"""Deterministic PC-control command routing.
+
+This catches common local-machine operations before the LLM can turn them into
+questions. The LLM is useful for reasoning; it should not be needed to create a
+folder on the user's Desktop.
+"""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from .brain import ToolCall
+
+
+@dataclass(frozen=True)
+class DirectCommand:
+    tool_call: ToolCall
+    final_prefix: str
+
+
+_CREATE_FOLDER_RE = re.compile(
+    r"\b(?:create|make|new)\s+(?:a\s+)?(?:folder|directory)\b(?P<body>.*)",
+    re.IGNORECASE,
+)
+_LIST_DESKTOP_RE = re.compile(
+    r"\b(?:list|show|what(?:'s|\s+is))\b.*\b(?:desktop|desktop\s+files)\b",
+    re.IGNORECASE,
+)
+_SYSTEM_STATUS_RE = re.compile(
+    r"\b(?:system\s+status|pc\s+status|computer\s+status|diagnostics|how\s+is\s+(?:my\s+)?pc)\b",
+    re.IGNORECASE,
+)
+_RUN_PS_RE = re.compile(
+    r"^\s*(?:run|execute)\s+(?:powershell|ps)\s*:?\s*(?P<command>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+_RUN_CMD_RE = re.compile(
+    r"^\s*(?:run|execute)\s+(?:command|cmd|shell)\s*:?\s*(?P<command>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+_OPEN_BROWSER_RE = re.compile(
+    r"^\s*(?:open|go\s+to|navigate\s+to)\s+(?:my\s+)?(?:browser\s+(?:to\s+)?)?(?P<target>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+_SCREENSHOT_BROWSER_RE = re.compile(
+    r"\b(?:screenshot|screen\s+shot|capture)\b.*\b(?:browser|page|website)\b",
+    re.IGNORECASE,
+)
+_AGENT_BACKEND_RE = re.compile(
+    r"^\s*(?P<prefix>"
+    r"(?:use|ask|run|delegate(?:\s+to)?)\s+"
+    r"(?:claude(?:\s+code)?|codex|opencode|open\s+code|agent\s+backend|backend)\s+"
+    r"(?:to\s+)?"
+    r"|"
+    r"(?:run|work|keep\s+going)\s+until\s+"
+    r"(?:you\s+)?(?:accomplish|finish|complete)\s+"
+    r"(?:the\s+)?(?:goal|task)\s*:?\s*"
+    r")(?P<goal>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_FOLDER_NAME_RE = re.compile(
+    r"\b(?:called|named|name(?:d)?\s+it|folder\s+called|folder\s+named)\s+"
+    r"(?P<name>[^.?!,;]+)",
+    re.IGNORECASE,
+)
+
+
+def desktop_path() -> Path:
+    return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+
+
+def direct_pc_command(user_text: str) -> DirectCommand | None:
+    text = (user_text or "").strip()
+    if not text:
+        return None
+
+    folder = _parse_create_folder(text)
+    if folder:
+        return DirectCommand(
+            tool_call=ToolCall("mkdir", {"path": str(folder)}),
+            final_prefix="Created the folder, sir.",
+        )
+
+    if _LIST_DESKTOP_RE.search(text):
+        return DirectCommand(
+            tool_call=ToolCall("list_dir", {"path": str(desktop_path()), "glob": "*", "recursive": False}),
+            final_prefix="Desktop scan complete, sir.",
+        )
+
+    if _SYSTEM_STATUS_RE.search(text):
+        return DirectCommand(
+            tool_call=ToolCall("system_status", {}),
+            final_prefix="System status, sir.",
+        )
+
+    if _SCREENSHOT_BROWSER_RE.search(text):
+        return DirectCommand(
+            tool_call=ToolCall("browser_screenshot", {"full_page": False}),
+            final_prefix="Browser screenshot captured, sir.",
+        )
+
+    agent_match = _AGENT_BACKEND_RE.search(text)
+    if agent_match:
+        goal = agent_match.group("goal").strip()
+        if goal:
+            return DirectCommand(
+                tool_call=ToolCall(
+                    "agent_backend_run",
+                    {
+                        "goal": goal,
+                        "backend": _backend_from_prefix(agent_match.group("prefix")),
+                        "cwd": str(Path.cwd()),
+                        "max_turns": 20,
+                        "timeout": 1800,
+                    },
+                ),
+                final_prefix="Agent backend run complete, sir.",
+            )
+
+    open_match = _OPEN_BROWSER_RE.search(text)
+    if open_match and _looks_like_browser_target(open_match.group("target")):
+        return DirectCommand(
+            tool_call=ToolCall("browser_open", {"url": open_match.group("target").strip()}),
+            final_prefix="Browser navigation complete, sir.",
+        )
+
+    ps_match = _RUN_PS_RE.search(text)
+    if ps_match:
+        return DirectCommand(
+            tool_call=ToolCall("run_powershell", {"command": ps_match.group("command").strip()}),
+            final_prefix="PowerShell command complete, sir.",
+        )
+
+    cmd_match = _RUN_CMD_RE.search(text)
+    if cmd_match:
+        return DirectCommand(
+            tool_call=ToolCall("run_shell", {"command": cmd_match.group("command").strip()}),
+            final_prefix="Command complete, sir.",
+        )
+
+    return None
+
+
+def _looks_like_browser_target(target: str) -> bool:
+    t = (target or "").strip().lower()
+    if not t:
+        return False
+    if t.startswith(("http://", "https://", "www.")):
+        return True
+    if "." in t and " " not in t:
+        return True
+    return any(word in t for word in ("website", "webpage", "google", "youtube", "github", "duckduckgo"))
+
+
+def _parse_create_folder(text: str) -> Path | None:
+    m = _CREATE_FOLDER_RE.search(text)
+    if not m:
+        return None
+
+    body = m.group("body") or ""
+    name_match = _FOLDER_NAME_RE.search(body)
+    if name_match:
+        folder_name = _clean_name(name_match.group("name"))
+    else:
+        folder_name = _clean_name(body)
+
+    if not folder_name:
+        return None
+
+    base = desktop_path() if re.search(r"\bdesktop\b", text, re.IGNORECASE) else Path.cwd()
+    return base / folder_name
+
+
+def _backend_from_prefix(prefix: str) -> str:
+    p = (prefix or "").lower()
+    if "claude" in p:
+        return "claude"
+    if "codex" in p:
+        return "codex"
+    if "opencode" in p or "open code" in p:
+        return "opencode"
+    return "auto"
+
+
+def _clean_name(raw: str) -> str:
+    name = (raw or "").strip().strip("\"'")
+    name = re.sub(r"^(?:on|in|at)\s+(?:my\s+)?desktop\s*", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b(?:on|in|at)\s+(?:my\s+)?desktop\b.*$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    # Windows-forbidden filename characters.
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    return name[:120].strip()
+
+===== jarvis\agents\voice.py =====
+from .base import Agent
+
+
+class VoiceAgent(Agent):
+    """OPTIONAL â€” disabled by default. Enable voice_tools_optional plugin first."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="voice",
+            description="OPTIONAL: speak text out loud / listen via microphone.",
+            system_prompt=(
+                "You are the VOICE agent. Use speak() to vocalise short replies. "
+                "Use listen() only when explicitly asked. If no microphone is detected, "
+                "fall back to text without complaining."
+            ),
+            tool_allowlist=["speak", "listen", "microphone_status"],
+        )
+
+===== jarvis\plugins\media_generation.py =====
+"""Local AI image + 3D generation tools.
+
+Image: `image_generate(prompt)` â€” FLUX.2-klein-4B (4B params, Apache 2.0).
+       Uses the unsloth Q6_K GGUF file for fast local inference.
+       Auto-downloads to  data/models/flux-2-klein-4b-Q6_K.gguf  on first run.
+
+       FLUX.2-klein is Black Forest Labs' fastest distilled model:
+         - 4B parameter rectified-flow transformer
+         - 4 inference steps (distilled)
+         - Q6_K weights: ~3.3 GB on disk, ~6 GB peak VRAM with BF16 activations
+         - Fits a 16 GB GPU alongside Whisper-turbo without CPU offload
+         - Apache 2.0 â€” fully open for commercial use
+
+3D:    `image_to_3d(image_path)` - TRELLIS.2 4B FP8 textured pipeline in an
+       isolated Python 3.12 worker. It auto-installs/downloads on first use and
+       exports textured GLB assets the Media Bay renders inline via
+       `<model-viewer>`. The VRAM manager evicts FLUX and Whisper before the
+       worker takes the GPU.
+
+All heavy imports + model loads happen LAZILY on first use.
+Progress is logged at every diffusion step so the terminal panel shows activity.
+"""
+from __future__ import annotations
+
+import asyncio
+import gc
+import hashlib
+import inspect
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from ..core.permissions import Permission
+from ..core.vram_manager import (
+    GPUResource,
+    apply_vram_cap,
+    cancel_idle_unload,
+    flush_gpu as _flush_gpu,
+    gpu_exclusive,
+    gpu_exclusive_async,
+    register_eviction,
+    register_idle_unload,
+    schedule_idle_unload,
+    safe_cuda_call,
+)
+from .base import PluginInfo, tool
+from ..core.task_progress import report as _progress_report
+
+log = logging.getLogger("jarvis.mediagen")
+
+MEDIA_PREFIX = "__JARVIS_MEDIA__"
+
+# â”€â”€ Model config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# GGUF file: unsloth Q6_K quantisation â€” ~3.3 GB, near-BF16 quality, fast.
+_GGUF_REPO   = "unsloth/FLUX.2-klein-4B-GGUF"
+_GGUF_FILE   = "flux-2-klein-4b-Q6_K.gguf"
+_HF_BASE     = "black-forest-labs/FLUX.2-klein-4B"   # VAE / text-encoders / scheduler
+
+# Pipeline tuning. The Q6_K transformer is only 3.4 GB, BUT the FLUX.2-klein
+# text encoder is a ~4B-param LLM = ~8 GB in BF16. Pinning the *whole* pipe on
+# CUDA at once (text_encoder 8 GB + transformer 3.4 GB + VAE + 1024Â² activations
+# + CUDA ctx) blows past 16 GB. On Windows the NVIDIA driver then SILENTLY spills
+# to system RAM over PCIe ("sysmem fallback") instead of OOMing â€” GPU sits at
+# 100% but every denoise step is PCIe-bound (~255 s first step). So we MUST use
+# model_cpu_offload: only the active module sits on GPU (encode â†’ denoise â†’ decode),
+# peak VRAM ~8 GB, no spill, full GPU speed. Per-gen cost: one ~1-2 s text-encoder
+# swap, vs 100Ã— slowdown from spilling.
+_FLUX_IDLE_UNLOAD_S: float = 0.0    # 0 = never unload (stays resident â†’ every gen instant); finite = free VRAM after N s idle
+_FLUX_USE_CPU_OFFLOAD = True        # REQUIRED: 8 GB text encoder over-commits 16 GB if fully resident â†’ driver sysmem spill
+_FLUX_PRELOAD_AT_STARTUP = False    # load on first image request, not at boot
+
+# -- 3D (Hunyuan3D-2GP Mini Turbo) config -----------------------------------
+# The true quantized Hunyuan GGUF options (calcuis/hy3d-gguf) are
+# ComfyUI/GGUF-node weights, not loadable by the native hy3dgen runtime without
+# embedding a ComfyUI worker. For Jarvis' direct Python tool path, the smallest
+# reliable no-access model is Tencent's 0.6B Mini Turbo shape model. It
+# downloads only the shape + turbo VAE folders, not the full 25 GB repo.
+_HY3DGP_SOURCE_COMMIT = "f2456e036a86a4b1d9f58e2379fe7ab0fe9b68b0"
+_HY3DGP_SOURCE_ZIP = (
+    "https://github.com/deepbeepmeep/Hunyuan3D-2GP/archive/"
+    f"{_HY3DGP_SOURCE_COMMIT}.zip"
+)
+_HY3D_REPO = "tencent/Hunyuan3D-2mini"
+_HY3D_SHAPE_SUBFOLDER = "hunyuan3d-dit-v2-mini-turbo"
+_HY3D_VAE_SUBFOLDER = "hunyuan3d-vae-v2-mini-turbo"
+_HY3D_KIND = "hunyuan3d-2gp-mini-turbo"
+_HY3D_LABEL = "Hunyuan3D-2GP Mini Turbo"
+_HY3D_STEPS = 5
+_HY3D_GUIDANCE = 5.0
+_HY3D_OCTREE_RES = 256
+_HY3D_NUM_CHUNKS = 80000
+_HY3D_IDLE_UNLOAD_S = 180.0
+_HY3D_RETRY_SEEDS = (3407, 1234, 2027)
+_HY3D_MC_LEVELS = (0.0, -1.0 / 512.0, 1.0 / 512.0)
+
+# -- 3D (TRELLIS.2 FP8 textured worker) config -------------------------------
+_TRELLIS2_KIND = "trellis2-fp8-textured"
+_TRELLIS2_LABEL = "TRELLIS.2 FP8 Textured"
+_TRELLIS2_MODEL_REPO = "visualbruno/TRELLIS.2-4B-FP8"
+_TRELLIS2_WORKER_TIMEOUT_S = int(os.getenv("JARVIS_TRELLIS2_TIMEOUT_S", "1200"))
+_TRELLIS2_SETUP_TIMEOUT_S = int(os.getenv("JARVIS_TRELLIS2_SETUP_TIMEOUT_S", "2400"))
+_TRELLIS2_DEFAULT_PIPELINE = os.getenv("JARVIS_TRELLIS2_PIPELINE", "512")
+_TRELLIS2_DEFAULT_STEPS = int(os.getenv("JARVIS_TRELLIS2_STEPS", "8"))
+_TRELLIS2_TEXTURE_STEPS = int(os.getenv("JARVIS_TRELLIS2_TEXTURE_STEPS", str(_TRELLIS2_DEFAULT_STEPS)))
+_TRELLIS2_MAX_TOKENS = int(os.getenv("JARVIS_TRELLIS2_MAX_TOKENS", "49152"))
+_TRELLIS2_TEXTURE_SIZE = int(os.getenv("JARVIS_TRELLIS2_TEXTURE_SIZE", "1024"))
+_TRELLIS2_EXPORT_MODE = os.getenv("JARVIS_TRELLIS2_EXPORT_MODE", "texture").strip().lower()
+_TRELLIS2_REMOVE_BACKGROUND = os.getenv("JARVIS_TRELLIS2_REMBG", "1").strip().lower() not in {"0", "false", "no"}
+
+
+@dataclass(frozen=True)
+class ImageModelSpec:
+    key: str
+    label: str
+    family: str
+    base_repo: str
+    artifact_repo: str
+    artifact_file: str
+    description: str
+    default_steps: int
+    default_guidance: float
+
+
+_DEFAULT_IMAGE_MODEL = "flux2-klein"
+_IMAGE_MODEL_ALIASES = {
+    "flux": "flux2-klein",
+    "flux2": "flux2-klein",
+    "flux2-klein-4b": "flux2-klein",
+    "flux.2-klein": "flux2-klein",
+}
+_IMAGE_MODELS: dict[str, ImageModelSpec] = {
+    "flux2-klein": ImageModelSpec(
+        key="flux2-klein",
+        label="FLUX.2-klein-4B Q6_K",
+        family="flux2",
+        base_repo=_HF_BASE,
+        artifact_repo=_GGUF_REPO,
+        artifact_file=_GGUF_FILE,
+        description="Fast local FLUX.2-klein generator, Q6_K GGUF transformer.",
+        default_steps=4,
+        default_guidance=4.0,
+    ),
+}
+
+# Singletons â€” loaded once per process.
+_flux_pipe   = None
+_flux_device: str | None = None
+_loaded_image_model: str | None = None
+_sf3d_model  = None
+_sf3d_device: str | None = None
+_hy3d_rembg = None      # cached Hunyuan3D background remover
+
+# NOTE: The old _gen_lock is replaced by the centralized VRAM manager's
+# gpu_exclusive_async(GPUResource.FLUX) which also evicts Whisper from GPU.
+
+
+# â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _images_dir(cfg) -> Path:
+    p = cfg.abs_path("data/generated/images")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _models_dir(cfg) -> Path:
+    p = cfg.abs_path("data/generated/models3d")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _local_models_dir(cfg) -> Path:
+    p = cfg.abs_path("data/models")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _normalize_image_model_key(key: str | None) -> str:
+    raw = (key or "").strip().lower()
+    if not raw:
+        raw = _DEFAULT_IMAGE_MODEL
+    return _IMAGE_MODEL_ALIASES.get(raw, raw)
+
+
+def _image_model_spec(cfg, requested: str | None = None) -> ImageModelSpec:
+    configured = getattr(getattr(cfg, "image_model", None), "selected", None)
+    key = _normalize_image_model_key(requested or configured)
+    spec = _IMAGE_MODELS.get(key)
+    if spec is None:
+        log.warning("Unknown image model '%s'; falling back to %s", key, _DEFAULT_IMAGE_MODEL)
+        spec = _IMAGE_MODELS[_DEFAULT_IMAGE_MODEL]
+    return spec
+
+
+def list_image_models(cfg) -> dict[str, Any]:
+    selected = _image_model_spec(cfg).key
+    models = []
+    for spec in _IMAGE_MODELS.values():
+        artifact_path = _local_models_dir(cfg) / spec.artifact_file
+        models.append({
+            "key": spec.key,
+            "label": spec.label,
+            "family": spec.family,
+            "description": spec.description,
+            "repo": spec.artifact_repo,
+            "file": spec.artifact_file,
+            "base_repo": spec.base_repo,
+            "local_path": str(artifact_path),
+            "downloaded": artifact_path.exists(),
+            "loaded": _loaded_image_model == spec.key and _flux_pipe is not None,
+            "default_steps": spec.default_steps,
+            "default_guidance": spec.default_guidance,
+        })
+    return {"selected": selected, "models": models}
+
+
+def select_image_model(cfg, key: str) -> dict[str, Any]:
+    normalized = _normalize_image_model_key(key)
+    if normalized not in _IMAGE_MODELS:
+        raise ValueError(f"unknown image model: {key}")
+    spec = _IMAGE_MODELS[normalized]
+    image_cfg = getattr(cfg, "image_model", None)
+    old_key = _image_model_spec(cfg).key
+    if image_cfg is not None:
+        image_cfg.selected = spec.key
+    if old_key != spec.key and _flux_pipe is not None:
+        _unload_flux_pipeline()
+    state = list_image_models(cfg)
+    return {"selected": spec.key, "model": next(m for m in state["models"] if m["key"] == spec.key)}
+
+
+def _select_device() -> str:
+[Additional lines omitted]
+
+===== jarvis\server\routes.py =====
+"""REST routes."""
+from __future__ import annotations
+
+import asyncio
+import base64
+import collections
+import io
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import tempfile
+import wave
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+import psutil
+from fastapi import APIRouter, Form, Query, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
+
+router = APIRouter()
+_stt_log = logging.getLogger("jarvis.stt")
+
+# â”€â”€ VRAM manager integration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+from ..core.vram_manager import (
+    GPUResource,
+    apply_vram_cap,
+    flush_gpu as _vram_flush,
+    register_eviction,
+)
+from ..core.language import (
+    default_language,
+    normalize_language,
+    stt_decode_options,
+    whisper_model_is_multilingual,
+)
+from ..core.tts_routing import (
+    TtsHop,
+    build_tts_plan,
+    fallback_plan_if_needed,
+    tts_response_headers,
+)
+import threading
+_whisper_lock = threading.Lock()  # prevent STT during GPU eviction
+
+
+# Whisper's training set was dominated by YouTube subtitles. On near-silent
+# or noisy clips the LM emits canned outros â€” "thank you for watching",
+# "please subscribe", lone "thanks", "you", "." â€” even with VAD on. We
+# pattern-match these and discard so they never reach the chat loop.
+_HALLUCINATION_RE = re.compile(
+    r"""^\s*
+    (?:
+      thanks?[\s,.!?]*(?:for\s+watching|for\s+listening)?[\s,.!?]*
+      (?:everyone|guys|all)?[\s,.!?]*
+    | thank\s+you[\s,.!?]*(?:for\s+watching|for\s+listening|so\s+much)?[\s,.!?]*
+    | (?:please\s+)?(?:like\s*(?:and\s+)?)?subscribe[\s,.!?]*(?:to\s+my\s+channel)?[\s,.!?]*
+    | bye(?:\s*bye)?[\s,.!?]*
+    | goodbye[\s,.!?]*
+    | (?:see|catch)\s+you\s+(?:later|next\s+time)[\s,.!?]*
+    | you[\s,.!?]*
+    | (?:oh|ohh+|uh|uhh+|um|umm+|hmm+|hm|ah|ahh+|aha|eh|ehh+|mm+|er|err+
+        |huh|ugh|oof|whoa|oops|mhm|uh[\s-]*huh|oh\s+my)[\s,.!?â€¦]*
+    | [.!?,â€¦\sâ™ªâ™«]+
+    )
+    \s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _filter_whisper_hallucination(text: str) -> str:
+    """Return empty string for transcripts that match the hallucination
+    blocklist; otherwise return the input unchanged."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if len(stripped) <= 1:
+        return ""
+    if _HALLUCINATION_RE.match(stripped):
+        _stt_log.info("STT: discarded hallucinated transcript: %r", stripped)
+        return ""
+    return text
+
+# â”€â”€ Live log streaming â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# A lightweight SSE log sink: last 300 records in memory, broadcast to all
+# connected clients via per-client asyncio.Queue.
+
+_LOG_BUFFER: collections.deque = collections.deque(maxlen=300)
+_LOG_QUEUES: set[asyncio.Queue] = set()
+_LOG_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+class _SSELogHandler(logging.Handler):
+    """Captures every log record, stores it, and fans out to live SSE clients."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            entry = {
+                "ts":    record.created,
+                "level": record.levelname,
+                "name":  record.name,
+                "msg":   self.format(record),
+            }
+            _LOG_BUFFER.append(entry)
+            loop = _LOG_LOOP
+            if loop and loop.is_running():
+                for q in list(_LOG_QUEUES):
+                    try:
+                        loop.call_soon_threadsafe(q.put_nowait, entry)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def install_log_handler() -> None:
+    """Wire the SSE handler so the in-app terminal sees every log record.
+
+    The `jarvis` logger has `propagate=False` (see core/logger.py), so records
+    emitted on `jarvis.*` never reach the root logger. Attach the SSE handler
+    to BOTH root (uvicorn, fastapi, asyncio, third-party noise) AND the
+    `jarvis` logger (every jarvis.* record). Without this fan-out the in-app
+    terminal stays empty even though the console log is busy.
+    """
+    global _LOG_LOOP
+    try:
+        _LOG_LOOP = asyncio.get_event_loop()
+    except RuntimeError:
+        pass
+    handler = _SSELogHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    # Attach to root + jarvis loggers; guard against duplicate adds.
+    for logger_name in ("", "jarvis"):
+        lg = logging.getLogger(logger_name)
+        if not any(isinstance(h, _SSELogHandler) for h in lg.handlers):
+            lg.addHandler(handler)
+        if logger_name == "jarvis" and lg.level > logging.DEBUG:
+            lg.setLevel(logging.DEBUG)
+
+
+@router.get("/logs")
+async def get_logs(n: int = 200):
+    """Return the last `n` log records as JSON."""
+    records = list(_LOG_BUFFER)[-n:]
+    return {"logs": records, "total": len(_LOG_BUFFER)}
+
+
+@router.get("/logs/stream")
+async def stream_logs(request: Request):
+    """Server-Sent Events stream of live log lines.
+
+    Clients receive the last 100 buffered records on connect, then new
+    records as they arrive.  A heartbeat comment is sent every 15 s so
+    proxies don't kill idle connections.
+    """
+    async def _generate():
+        q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        _LOG_QUEUES.add(q)
+        try:
+            # Replay recent history.
+            for entry in list(_LOG_BUFFER)[-100:]:
+                yield f"data: {json.dumps(entry)}\n\n"
+            # Stream new events.
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    entry = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield f"data: {json.dumps(entry)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"   # keep-alive comment
+        finally:
+            _LOG_QUEUES.discard(q)
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
+
+JARVIS_TTS_VOICE = "en-GB-ThomasNeural"
+NVIDIA_WAVEGLOW_URL = (
+    "https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tlt-jarvis/"
+    "models/speechsynthesis_waveglow?version=deployable_v1.0"
+)
+
+
+@router.post("/stt")
+async def speech_to_text(
+    request: Request,
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+):
+    """Receive audio from browser MediaRecorder, transcribe with Whisper.
+
+    Language is auto-detected unless config/user pins a code. Never force English.
+    """
+    import asyncio
+    cfg, *_ = _services(request)
+    data = await audio.read()
+    if not data:
+        return JSONResponse(
+            {"text": "", "language": None, "confidence": None, "error": "empty audio"},
+            status_code=400,
+        )
+
+    _stt_log.info("STT: received %d bytes", len(data))
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".webm", delete=False)
+    tmp.write(data)
+    tmp.close()
+
+    whisper_kw = stt_decode_options(cfg, language)
+    model_name = "small" if _whisper_device == "cpu" else "large-v3-turbo"
+    if not whisper_model_is_multilingual(model_name):
+        _stt_log.warning("STT: configured Whisper model %s is English-only", model_name)
+
+    def _post_process(text: str) -> str:
+        """Drop common Whisper hallucinations on near-silent audio."""
+        return _filter_whisper_hallucination(text)
+
+    def _transcribe_once(model, path: str):
+        segments, info = model.transcribe(path, **whisper_kw)
+        text = _post_process(" ".join(seg.text.strip() for seg in segments).strip())
+        lang = getattr(info, "language", None)
+        conf = getattr(info, "language_probability", None)
+        try:
+            conf = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf = None
+        return text, lang, conf
+
+[Additional lines omitted]
+
+===== jarvis\core\config_multilingual.yaml =====
+multilingual_config:
+  enabled: true
+  auto_detect_language: true
+  default_language: "en"
+  default_gender: "female"
+  fallback_voice: "en-GB-ThomasNeural"
+  stt_engine: "faster-whisper"
+  stt_model_size: "base"
+  stt_device: "cpu"

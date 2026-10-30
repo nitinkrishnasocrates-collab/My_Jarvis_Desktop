@@ -1,0 +1,1483 @@
+﻿JARVIS SEARCH REVIEW 2
+Project: C:\Users\hp\Music\JARVIS-main
+Generated: 2026-10-24 21:22:19
+
+
+========== jarvis\plugins\web_tools.py ==========
+"""Web search + fetch â€” JARVIS OS edition.
+
+Tools return *structured JSON strings* prefixed with `__JARVIS_MEDIA__` so the
+orchestrator's emit-hook can lift them into a `media` event for the Media Bay.
+
+Providers:
+  duckduckgo  â€” no key needed (default)
+  brave       â€” BRAVE_API_KEY
+  tavily      â€” TAVILY_API_KEY
+  serpapi     â€” SERPAPI_API_KEY
+"""
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote, urlparse
+
+import httpx
+
+from ..core.permissions import Permission
+from .base import PluginInfo, tool
+
+MEDIA_PREFIX = "__JARVIS_MEDIA__"
+
+
+def _media(kind: str, items: list[dict], summary: str = "") -> str:
+    """Encode a media payload that the orchestrator emit-hook will pluck out."""
+    payload = {"kind": kind, "items": items, "summary": summary}
+    return MEDIA_PREFIX + json.dumps(payload, ensure_ascii=False)
+
+
+def register(registry):
+    cfg = registry.cfg
+    toggle = cfg.plugins.get("web_tools")
+    provider = (toggle.provider if toggle else None) or "duckduckgo"
+
+    @tool(
+        name="web_search",
+        description=(
+            "Search the web for fresh facts, news, docs, or any text-based query. "
+            "Results are rendered as clickable cards in the Media Bay AUTOMATICALLY. "
+            "Always call this before answering questions about current events, "
+            "products, people, prices, releases, or anything time-sensitive."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 6},
+            },
+            "required": ["query"],
+        },
+        preview=lambda a: f"web search: {a.get('query','')}",
+    )
+    async def web_search(query: str, max_results: int = 6) -> str:
+        # Route news-y queries into a dedicated news kind so the UI can
+        # surface them in their own NEWS panel separate from generic web
+        # results. Falls back to plain web search if Google News empty.
+        is_news = _is_news_query(query)
+        try:
+            items: list[dict] = []
+            if is_news:
+                items = await _google_news(query, max_results)
+            if not items:
+                items = await _do_search(provider, query, max_results)
+                is_news = False  # fell back to web â€” render as search
+        except Exception as e:  # noqa: BLE001
+            return f"web search failed ({provider}): {e}"
+        if not items:
+            return f"web search ({provider}): no results for '{query}'"
+        # Plain text fallback (for the model's tool-loop)
+        text_lines = [f"Found {len(items)} results for '{query}':"]
+        for i, r in enumerate(items, 1):
+            text_lines.append(f"{i}. {r.get('title','(no title)')} â€” {r.get('url','')}")
+            if r.get("snippet"):
+                text_lines.append(f"   {r['snippet']}")
+        return _media("news" if is_news else "search", items, "\n".join(text_lines))
+
+    @tool(
+        name="image_search",
+        description=(
+            "Search the web for IMAGES. Results render as a thumbnail grid in the "
+            "Media Bay; click to view full size. Use whenever the user asks for "
+            "pictures, photos, logos, diagrams, screenshots, or anything visual."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 12},
+            },
+            "required": ["query"],
+        },
+        preview=lambda a: f"image search: {a.get('query','')}",
+    )
+    async def image_search(query: str, max_results: int = 12) -> str:
+        try:
+            items = await _ddg_images(query, max_results)
+        except Exception as e:  # noqa: BLE001
+            return f"image search failed: {e}"
+        if not items:
+            return f"image search: no results for '{query}'"
+        return _media("images", items, f"{len(items)} images for '{query}'")
+
+    @tool(
+        name="video_search",
+        description=(
+            "Search YouTube for VIDEOS. Results render as embedded players in the "
+            "Media Bay â€” playable inline without leaving JARVIS. Use for tutorials, "
+            "trailers, music, lectures, or any 'show me a video of X' request."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_results": {"type": "integer", "default": 6},
+            },
+            "required": ["query"],
+        },
+        preview=lambda a: f"video search: {a.get('query','')}",
+    )
+    async def video_search(query: str, max_results: int = 6) -> str:
+        try:
+            items = await _yt_search(query, max_results)
+        except Exception as e:  # noqa: BLE001
+            return f"video search failed: {e}"
+        if not items:
+            return f"video search: no results for '{query}'"
+        return _media("videos", items, f"{len(items)} videos for '{query}'")
+
+    @tool(
+        name="open_inline",
+        description=(
+            "Embed a web page directly inside the Media Bay iframe â€” never opens a "
+            "real browser window. Pass an absolute URL. Use whenever the user says "
+            "'open / show me / pull up <site>'."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "url":   {"type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["url"],
+        },
+        preview=lambda a: f"embed inline: {a.get('url','')}",
+    )
+    async def open_inline(url: str, title: str = "") -> str:
+        u = url.strip()
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        item = {
+            "url": u,
+            "title": title or _host(u),
+            "thumbnail": _favicon(u),
+        }
+        return _media("page", [item], f"Embedded: {item['title']}")
+
+    @tool(
+        name="media_show",
+        description=(
+            "Push an arbitrary media card (image / video / link / page) to the "
+            "Media Bay. Useful for surfacing a single result without searching."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "kind":      {"type": "string", "enum": ["image", "video", "page", "search"]},
+                "url":       {"type": "string"},
+                "title":     {"type": "string"},
+                "snippet":   {"type": "string"},
+                "thumbnail": {"type": "string"},
+            },
+            "required": ["kind", "url"],
+        },
+        preview=lambda a: f"media_show: {a.get('kind','')} {a.get('url','')[:60]}",
+    )
+    async def media_show(kind: str, url: str, title: str = "", snippet: str = "", thumbnail: str = "") -> str:
+        item = {"url": url, "title": title or _host(url), "snippet": snippet, "thumbnail": thumbnail or _favicon(url)}
+        return _media(kind, [item], f"Surfaced: {item['title']}")
+
+    @tool(
+        name="webcam_show",
+        description=(
+            "â˜… PREFERRED for any 'see / look / view / show me / I want to show "
+            "you' webcam intent. Opens the LIVE webcam feed inline in the Media "
+            "Bay with HUD overlay. Phrases that trigger this tool: "
+            "'look at what I'm holding', 'can you see me?', 'show me on camera', "
+            "'open the webcam', 'turn on the camera', 'take a look', "
+            "'I want you to see this', 'mirror me'. "
+            "Do NOT call `webcam_snapshot` for these â€” that is a silent "
+            "background capture, not a viewer."
+        ),
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "title":  {"type": "string"},
+                "mirror": {"type": "boolean", "default": True},
+            },
+        },
+        preview=lambda a: "webcam_show (live feed)",
+    )
+    async def webcam_show(title: str = "WEBCAM FEED", mirror: bool = True) -> str:
+        item = {
+            "url": "webcam://local",
+            "title": title,
+            "snippet": "Live feed from primary capture device.",
+            "thumbnail": "",
+        }
+        # Pass an extra `mirror` flag through the item so the UI can read it.
+        item["mirror"] = "1" if mirror else "0"  # type: ignore[assignment]
+        return _media("webcam", [item], f"Webcam opened: {title}")
+
+    @tool(
+        name="web_fetch",
+        description="Fetch a URL and return its readable text content (HTML stripped).",
+        permission=Permission.SAFE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "url":       {"type": "string"},
+                "max_chars": {"type": "integer", "default": 8000},
+            },
+            "required": ["url"],
+        },
+        preview=lambda a: f"GET {a.get('url','')}",
+    )
+    async def web_fetch(url: str, max_chars: int = 8000) -> str:
+        # Use a realistic browser UA + standard accept headers. Many sites
+        # (Cloudflare, Akamai, etc.) 403 anything that smells like a bot.
+        # Don't raise on 4xx/5xx â€” return a soft error string so multi-fetch
+        # callers (deep research) continue with the next URL instead of
+        # bombing the whole tool chain.
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
+                r = await c.get(url)
+            if r.status_code >= 400:
+                return f"[web_fetch: HTTP {r.status_code} for {url} â€” site blocked the fetch]"
+            text = _html_to_text(r.text)
+            return text[:max_chars] if text else f"[web_fetch: empty body for {url}]"
+        except httpx.HTTPError as e:
+            return f"[web_fetch: network error for {url}: {e}]"
+
+    registry.add_pending("web_tools")
+    registry.register_plugin(PluginInfo(
+        name="web_tools",
+        description=f"In-app web search, images, videos, page embedding (provider: {provider}).",
+        permissions_needed=[Permission.SAFE],
+    ))
+
+
+# ============================== providers ===================================
+
+async def _do_search(provider: str, query: str, n: int) -> list[dict]:
+    if provider == "duckduckgo": return await _ddg_text(query, n)
+    if provider == "brave":      return await _brave(query, n)
+    if provider == "tavily":     return await _tavily(query, n)
+    if provider == "serpapi":    return await _serpapi(query, n)
+    return await _ddg_text(query, n)
+
+
+def _is_news_query(query: str) -> bool:
+    return bool(re.search(r"\b(?:news|headlines|breaking|latest|current|recent)\b", query or "", re.IGNORECASE))
+
+
+async def _google_news(query: str, n: int) -> list[dict]:
+    async with httpx.AsyncClient(
+        timeout=20,
+        follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+    ) as c:
+        r = await c.get(
+            "https://news.google.com/rss/search",
+            params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+        )
+        r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+    out: list[dict] = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        url = (item.findtext("link") or "").strip()
+        source = (item.findtext("source") or _host(url)).strip()
+        published = _format_pub_date(item.findtext("pubDate") or "")
+        if not title or not url:
+            continue
+        snippet = f"{source}{f' Â· {published}' if published else ''}"
+        out.append({
+            "url": url,
+            "title": title,
+            "snippet": snippet,
+            "thumbnail": _favicon(url),
+            "source": source,
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
+def _format_pub_date(value: str) -> str:
+    try:
+        dt = parsedate_to_datetime(value)
+        return f"{dt:%b} {dt.day}, {dt:%Y %H:%M}"
+    except Exception:
+        return ""
+
+
+DDG_RESULT_RE = re.compile(
+    r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+    r'(?:.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>)?',
+    re.DOTALL,
+)
+
+
+def _strip(s: str) -> str:
+    s = re.sub(r"<[^>]+>", "", s or "")
+    return " ".join(html.unescape(s).split())
+
+
+def _host(url: str) -> str:
+    try:
+        return urlparse(url).netloc or url
+    except Exception:
+        return url
+
+
+def _favicon(url: str) -> str:
+    h = _host(url)
+    if not h:
+        return ""
+    return f"https://www.google.com/s2/favicons?sz=64&domain={quote(h)}"
+
+
+async def _ddg_text(query: str, n: int) -> list[dict]:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        r = await c.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        r.raise_for_status()
+    out: list[dict] = []
+    for m in DDG_RESULT_RE.finditer(r.text):
+        url = m.group(1)
+        if url.startswith("//duckduckgo.com/l/"):
+            mu = re.search(r"uddg=([^&]+)", url)
+            if mu:
+                from urllib.parse import unquote
+                url = unquote(mu.group(1))
+        out.append({
+            "url": url,
+            "title": _strip(m.group(2)),
+            "snippet": _strip(m.group(3) or ""),
+            "thumbnail": _favicon(url),
+            "source": _host(url),
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
+async def _ddg_images(query: str, n: int) -> list[dict]:
+    """DuckDuckGo image search via the unofficial JSON endpoint."""
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as c:
+        # First request hits a vqd token.
+        r = await c.get("https://duckduckgo.com/", params={"q": query})
+        m = re.search(r'vqd=([\d-]+)', r.text) or re.search(r'vqd="([^"]+)"', r.text)
+        if not m:
+            return []
+        vqd = m.group(1)
+        ir = await c.get(
+            "https://duckduckgo.com/i.js",
+            params={"l": "us-en", "o": "json", "q": query, "vqd": vqd, "p": "1"},
+            headers={"Referer": "https://duckduckgo.com/"},
+        )
+        if ir.status_code != 200:
+            return []
+        try:
+            data = ir.json()
+        except Exception:
+            return []
+    items = []
+    for r in (data.get("results") or [])[:n]:
+        items.append({
+            "url":       r.get("image"),
+            "thumbnail": r.get("thumbnail") or r.get("image"),
+            "title":     r.get("title", ""),
+            "source":    r.get("source", ""),
+            "host":      r.get("url", ""),
+            "width":     r.get("width"),
+            "height":    r.get("height"),
+        })
+    return items
+
+
+async def _yt_search(query: str, n: int) -> list[dict]:
+    """Scrape YouTube results page â€” no API key, no quota."""
+    url = "https://www.youtube.com/results"
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}) as c:
+        r = await c.get(url, params={"search_query": query})
+        r.raise_for_status()
+    # Pull videoRenderer entries from ytInitialData
+    m = re.search(r"var ytInitialData = (\{.*?\});</script>", r.text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return []
+    out: list[dict] = []
+    sections = (
+        data.get("contents", {})
+        .get("twoColumnSearchResultsRenderer", {})
+        .get("primaryContents", {})
+        .get("sectionListRenderer", {})
+        .get("contents", [])
+    )
+    for s in sections:
+        for item in s.get("itemSectionRenderer", {}).get("contents", []):
+            vr = item.get("videoRenderer")
+            if not vr:
+                continue
+            vid = vr.get("videoId")
+            if not vid:
+                continue
+            title = "".join(t.get("text", "") for t in vr.get("title", {}).get("runs", []))
+            chan  = "".join(t.get("text", "") for t in vr.get("ownerText", {}).get("runs", []))
+            thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
+            duration = vr.get("lengthText", {}).get("simpleText", "")
+            published = vr.get("publishedTimeText", {}).get("simpleText", "")
+            views = vr.get("viewCountText", {}).get("simpleText", "")
+            out.append({
+                "url":         f"https://www.youtube.com/watch?v={vid}",
+                "embed_url":   f"https://www.youtube.com/embed/{vid}",
+                "video_id":    vid,
+                "title":       title,
+                "channel":     chan,
+                "thumbnail":   thumbs[-1]["url"] if thumbs else "",
+                "duration":    duration,
+                "published":   published,
+                "views":       views,
+            })
+            if len(out) >= n:
+                return out
+    return out
+
+
+async def _brave(query: str, n: int) -> list[dict]:
+    key = os.environ.get("BRAVE_API_KEY", "")
+    if not key: raise RuntimeError("BRAVE_API_KEY missing")
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": n},
+            headers={"X-Subscription-Token": key, "Accept": "application/json"},
+        )
+        r.raise_for_status()
+    data = r.json()
+    return [
+        {
+            "title": x.get("title"), "url": x.get("url"),
+            "snippet": x.get("description", ""),
+            "thumbnail": (x.get("thumbnail") or {}).get("src") or _favicon(x.get("url", "")),
+            "source": _host(x.get("url", "")),
+        }
+        for x in data.get("web", {}).get("results", [])[:n]
+    ]
+
+
+async def _tavily(query: str, n: int) -> list[dict]:
+    key = os.environ.get("TAVILY_API_KEY", "")
+    if not key: raise RuntimeError("TAVILY_API_KEY missing")
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.post(
+            "https://api.tavily.com/search",
+            json={"api_key": key, "query": query, "max_results": n, "include_images": True},
+        )
+        r.raise_for_status()
+    data = r.json()
+    return [
+        {
+            "title": x.get("title"), "url": x.get("url"),
+            "snippet": x.get("content", ""),
+            "thumbnail": _favicon(x.get("url", "")),
+            "source": _host(x.get("url", "")),
+        }
+        for x in data.get("results", [])[:n]
+    ]
+
+
+async def _serpapi(query: str, n: int) -> list[dict]:
+    key = os.environ.get("SERPAPI_API_KEY", "")
+    if not key: raise RuntimeError("SERPAPI_API_KEY missing")
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get("https://serpapi.com/search.json", params={"q": query, "api_key": key, "num": n})
+        r.raise_for_status()
+    data = r.json()
+    return [
+        {
+            "title": x.get("title"), "url": x.get("link"),
+            "snippet": x.get("snippet", ""),
+            "thumbnail": _favicon(x.get("link", "")),
+            "source": _host(x.get("link", "")),
+        }
+        for x in data.get("organic_results", [])[:n]
+    ]
+
+
+def _html_to_text(html_text: str) -> str:
+    html_text = re.sub(r"<script\b[^>]*>.*?</script>", "", html_text, flags=re.DOTALL | re.IGNORECASE)
+    html_text = re.sub(r"<style\b[^>]*>.*?</style>", "", html_text, flags=re.DOTALL | re.IGNORECASE)
+    html_text = re.sub(r"<[^>]+>", " ", html_text)
+    html_text = html.unescape(html_text)
+    return re.sub(r"\s+\n", "\n", re.sub(r"[ \t]+", " ", html_text)).strip()
+
+========== jarvis\core\intent_router.py ==========
+"""Deterministic intent router.
+
+Sits between the user's raw utterance and the LLM. Catches high-confidence
+intents (web search, image search, video search, open URL, create folder,
+system status, run shell, â€¦) and dispatches them as direct tool calls.
+
+Why this exists
+---------------
+The LLM is excellent at reasoning over ambiguous prompts but unreliable at
+*picking the right tool* between near-synonyms ("browser_open" vs
+"web_search"). Real-world example: "populate the latest news on Elon Musk"
+should always populate the Media Bay via `web_search`, never spawn a
+visible browser via `browser_open`. The router enforces this contract
+deterministically â€” the LLM is only invoked when no high-confidence
+intent matches.
+
+Architecture
+------------
+- `Intent` dataclass holds a name, pattern, builder, and final-reply
+  prefix. Builders take the regex match and return a `ToolCall` plus the
+  human-readable wrap-up the assistant will speak after the tool runs.
+- Intents are ordered by precedence (most specific first). The first
+  match wins.
+- Each match is logged through `jarvis.intent` for diagnostics; the
+  orchestrator can also surface this to the UI as an INFO event.
+
+Adding a new intent
+-------------------
+1. Register an `Intent(...)` in INTENTS, ideally above any broader rule
+   that might steal its trigger.
+2. If the intent maps to a new tool, add it to the plugin registry first.
+3. Add a fixture under `tests/intent_router_test.py` (todo: scaffold).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Pattern
+
+from .brain import ToolCall
+
+log = logging.getLogger("jarvis.intent")
+
+
+@dataclass(frozen=True)
+class IntentMatch:
+    """Result of intent routing."""
+    name: str                     # intent name (for logs / UI surfaces)
+    tool_call: ToolCall           # tool + arguments to dispatch
+    final_prefix: str             # what the assistant says after the tool returns
+    raw_match: str = ""           # the substring that triggered the match
+
+
+@dataclass(frozen=True)
+class Intent:
+    name: str
+    pattern: Pattern[str]
+    builder: Callable[[re.Match], IntentMatch | None]
+    description: str = ""
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def _desktop_path() -> Path:
+    return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
+
+
+def _clean_query(q: str) -> str:
+    """Strip filler phrasing so the search engine sees a clean query."""
+    q = (q or "").strip().strip(" .!?\"'")
+    # Strip leading verbs and articles that aren't part of the query.
+    q = re.sub(
+        r"^(?:please|kindly|could\s+you|can\s+you|would\s+you|just|simply|then)\s+",
+        "", q, flags=re.IGNORECASE,
+    )
+    q = re.sub(
+        r"^(?:about|for|on|regarding|concerning|some|any|the)\s+",
+        "", q, flags=re.IGNORECASE,
+    )
+    return q.strip()
+
+
+def _looks_like_url(target: str) -> bool:
+    t = (target or "").strip().lower()
+    if not t:
+        return False
+    if t.startswith(("http://", "https://", "www.")):
+        return True
+    # Bare host like "anthropic.com" â€” only treat as URL if it has no spaces
+    # AND has a dot AND has no question words.
+    if "." in t and " " not in t and not re.search(r"\b(?:what|who|when|where|why|how|is|are|the)\b", t):
+        return True
+    # Well-known site shortcuts.
+    return t in {"google", "youtube", "github", "stackoverflow", "duckduckgo", "twitter", "x", "reddit"}
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ pattern catalogue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Order matters: more specific patterns first.
+
+# === Media / search intents (priority over browser_open) ===
+
+# 1) Image search â€” must come BEFORE generic web search.
+_IMAGE_SEARCH_RE = re.compile(
+    r"\b(?:"
+    r"show\s+(?:me\s+)?(?:some\s+|a\s+few\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"find\s+(?:me\s+)?(?:some\s+|a\s+few\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"search\s+(?:for\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"pull\s+up\s+(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"(?:get|grab|fetch)\s+(?:me\s+)?(?:some\s+)?(?:pictures|photos|images|pics)\s+(?:of|for)|"
+    r"(?:image|picture|photo)\s+search\s+(?:for|of)|"
+    r"image\s+results?\s+(?:for|of)"
+    r")\s+(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_image_search(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="image_search",
+        tool_call=ToolCall("image_search", {"query": q, "max_results": 12}),
+        final_prefix=f"Image grid for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 2) Video search.
+_VIDEO_SEARCH_RE = re.compile(
+    r"\b(?:"
+    r"(?:show|find|play|get|grab|queue|pull\s+up|bring\s+up|look\s+up)\s+(?:me\s+)?(?:a\s+|some\s+)?(?:video|videos|clip|clips|footage)\s+(?:of|for|about|on)|"
+    r"search\s+(?:youtube|yt)\s+(?:for\s+)?|"
+    r"youtube\s+(?:search\s+)?(?:for|of)|"
+    r"(?:video|youtube)\s+results?\s+(?:for|of)"
+    r")\s+(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_video_search(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="video_search",
+        tool_call=ToolCall("video_search", {"query": q, "max_results": 8}),
+        final_prefix=f"Video results for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 3) Web search â€” broad. Includes "news/latest/headlines/populate/find/look up
+#    /search/google/research". This is the CRITICAL rule that prevents the
+#    regression where "populate latest news on X" opened a browser instead.
+#
+# Design rule: each alternative ends at a *keyword boundary*, not on
+# whitespace. The outer `\s*(?P<q>.+)` absorbs any separator between the
+# trigger and the query payload. This avoids the trap where a trailing
+# `\s+` in an alternative + outer `\s+` together demanded TWO whitespaces.
+# Each trigger must be followed by whitespace (lookahead `(?=\s)`) so that
+# random text like "google.com" or "https://news.ycombinator.com" never
+# fires the web-search intent â€” those belong to `open_browser`.
+_WEB_SEARCH_RE = re.compile(
+    r"\b(?:"
+    # explicit search verbs
+    r"search(?:\s+online|\s+the\s+web|\s+google)?(?:\s+for)?(?=\s)|"
+    r"google(?:\s+for)?(?=\s)|"
+    r"look\s+up(?:\s+online)?(?=\s)|"
+    r"find(?:\s+me)?(?:\s+online)?(?:\s+(?:articles?|info|information|results?))?(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    # "list available jobs in cairo" / "show me a list of restaurants" â€” lookahead
+    # keeps the web-noun in the query and blocks filesystem-intent collisions.
+    r"(?:list|show\s+me\s+a\s+list\s+of)\s+(?:[a-z]+\s+){0,3}?(?=(?:jobs?|vacancies|openings|listings?|restaurants?|hotels?|flights?|events?|places?|gyms?|cafes?|bars?|shops?|stores?|attractions?|activities|things\s+to\s+do)\b)|"
+    # populate / pull up / show me + (latest)? news/results/etc + topic
+    r"populate(?:\s+(?:the|my))?(?:\s+media\s+bay\s+with)?(?:\s+(?:latest|recent))?\s+(?:news|results|articles?|info|stories)(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    r"pull\s+up(?:\s+(?:the|some))?(?:\s+(?:latest|recent))?\s+(?:news|results|articles?|info|stories)(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    r"show\s+me(?:\s+(?:the|some))?(?:\s+(?:latest|recent))?\s+(?:news|results|articles?|info|stories|headlines)(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    # "what's the latest on X" / "whats happening with X" / "what is happening with X"
+    r"what(?:'s|s|\s+is)(?:\s+the)?\s+(?:latest|new|happening|going\s+on)(?:\s+(?:with|about|on|for|in))?(?=\s)|"
+    # "research X" / "do research on X"
+    r"(?:do\s+|some\s+)?research(?:\s+(?:on|about|for|regarding))?(?=\s)|"
+    # bare "news/headlines about X" â€” last resort, requires trailing whitespace
+    r"(?:(?:latest|recent|today's|todays)\s+)?(?:news|headlines)(?:\s+(?:on|about|for|regarding))?(?=\s)"
+    r")\s*(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_web_search(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="web_search",
+        tool_call=ToolCall("web_search", {"query": q, "max_results": 8}),
+        final_prefix=f"Search complete for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 3b) Bare "latest news" â€” no topic. The topic'd web_search above requires a
+# query after "news", so "pull up the latest news" / "show me the news" (clause
+# end) fall through. End-anchored so a topic'd request ("...news on cairo")
+# never matches here. Maps to a general headline search.
+_NEWS_BARE_RE = re.compile(
+    r"\b(?:"
+    r"(?:populate|pull\s+up|show(?:\s+me)?|get|grab|give\s+me|bring\s+up|fetch|open)"
+    r"(?:\s+(?:the|some|me))?(?:\s+(?:latest|recent|today'?s))?\s+(?:news|headlines)"
+    r"|what(?:'s|s|\s+is)(?:\s+the)?\s+(?:latest\s+)?news"
+    r"|(?:the\s+)?(?:latest|recent|today'?s)\s+(?:news|headlines)"
+    r")\s*[.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _build_news_bare(m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="web_search",
+        tool_call=ToolCall("web_search", {"query": "latest news today", "max_results": 8}),
+        final_prefix="The latest headlines are in the Media Bay, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 4) Embed a known URL inline (Media Bay iframe). Triggers on
+#    "open inline / embed / pull up <URL>".
+_OPEN_INLINE_RE = re.compile(
+    r"\b(?:"
+    r"(?:open|pull\s+up|embed|preview|show)\s+(?:inline|in\s+the\s+media\s+bay|in\s+media\s+bay|in\s+app)\s+(?P<u>\S+)|"
+    r"embed\s+(?P<u2>\S+)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _build_open_inline(m: re.Match) -> IntentMatch | None:
+    u = (m.group("u") or m.group("u2") or "").strip()
+    if not u:
+        return None
+    return IntentMatch(
+        name="open_inline",
+        tool_call=ToolCall("open_inline", {"url": u}),
+        final_prefix=f"Embedded {u} in the Media Bay, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 4a) Local image generation (must come BEFORE image_search so "generate a
+#     picture of X" doesn't get routed to DuckDuckGo image search).
+_IMAGE_GEN_RE = re.compile(
+    r"\b(?:"
+    r"(?:generate|create|make|draw|render|paint|design|produce|synthes(?:i[sz]e|e))\s+(?:me\s+)?"
+    r"(?:an?\s+|some\s+)?(?:image|picture|photo|pic|artwork|illustration|render(?:ing)?|painting|drawing|logo|wallpaper|portrait)\s+"
+    r"(?:of|showing|depicting|with|for|about)|"
+    r"(?:ai[- ]?(?:image|art)\s+(?:of|for))|"
+    r"text[- ]?to[- ]?image\s+(?:of|for)|"
+    r"diffuse\s+(?:me\s+)?(?:an?\s+)?(?:image|picture)\s+of"
+    r")(?=\s)(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_image_gen(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="image_generate",
+        tool_call=ToolCall("image_generate", {"prompt": q}),
+        final_prefix=f"Image rendered for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 4b) Text-to-3D generation.
+_TEXT_TO_3D_RE = re.compile(
+    r"\b(?:"
+    r"(?:generate|create|make|render|build|produce)\s+(?:a\s+|me\s+(?:a\s+)?)?(?:3d\s+(?:model|asset|object|mesh)|hologram|three[- ]dimensional\s+model)\s+(?:of|for|from|showing)|"
+    r"(?:turn|convert)\s+(?:that|this|it)?\s*into\s+(?:a\s+)?(?:3d|hologram)|"
+    r"text[- ]?to[- ]?3d\s+(?:of|for)"
+    r")(?=\s)(?P<q>.+)",
+    re.IGNORECASE,
+)
+
+
+def _build_text_to_3d(m: re.Match) -> IntentMatch | None:
+    q = _clean_query(m.group("q"))
+    if not q:
+        return None
+    return IntentMatch(
+        name="text_to_3d",
+        tool_call=ToolCall("text_to_3d", {"prompt": q}),
+        final_prefix=f"3D model generated for â€œ{q}â€, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 5) Memory galaxy.
+_MEMORY_GALAXY_RE = re.compile(
+    r"\b(?:"
+    r"show\s+(?:me\s+)?(?:my\s+)?memory\s+galaxy|"
+    r"open\s+(?:the\s+)?(?:neural\s+)?(?:cloud|galaxy)|"
+    r"visualise\s+(?:my\s+)?(?:memory|data|knowledge)|"
+    r"what\s+do\s+you\s+remember\s+about\s+me"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _build_memory_galaxy(m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="memory_galaxy",
+        tool_call=ToolCall("memory_galaxy", {}),
+        final_prefix="Neural cloud surfaced, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# 6) Webcam vision.
+_WEBCAM_SEE_RE = re.compile(
+    r"\b(?:"
+    r"(?:can\s+you\s+|please\s+)?(?:see|look\s+at)\s+(?:me|what\s+i(?:'|\s+a)m\s+holding|this)|"
+    r"what\s+(?:am\s+i\s+holding|do\s+you\s+see)|"
+    r"take\s+a\s+look\s+at\s+(?:what\s+i(?:'|\s+a)m\s+holding|this)|"
+    r"describe\s+what\s+you\s+see"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _build_webcam_see(m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="webcam_see",
+        tool_call=ToolCall("webcam_see", {}),
+        final_prefix="Vision pass complete, sir.",
+        raw_match=m.group(0),
+    )
+
+
+# === System / FS / shell intents ===
+
+_CREATE_FOLDER_RE = re.compile(
+    r"\b(?:create|make|new)\s+(?:a\s+)?(?:folder|directory)\b(?P<body>.*)",
+    re.IGNORECASE,
+)
+_FOLDER_NAME_RE = re.compile(
+    r"\b(?:called|named|name(?:d)?\s+it|folder\s+called|folder\s+named)\s+"
+    r"(?P<name>[^.?!,;]+)",
+    re.IGNORECASE,
+)
+
+
+def _build_create_folder(m: re.Match) -> IntentMatch | None:
+    body = m.group("body") or ""
+    text_all = m.string
+    name_match = _FOLDER_NAME_RE.search(body)
+    raw = (name_match.group("name") if name_match else body).strip().strip("\"'")
+    raw = re.sub(r"^(?:on|in|at)\s+(?:my\s+)?desktop\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\b(?:on|in|at)\s+(?:my\s+)?desktop\b.*$", "", raw, flags=re.IGNORECASE)
+    name = re.sub(r'[<>:"/\\|?*]', "_", raw).strip(" .")[:120].strip()
+    if not name:
+        return None
+    base = _desktop_path() if re.search(r"\bdesktop\b", text_all, re.IGNORECASE) else Path.cwd()
+    return IntentMatch(
+        name="create_folder",
+        tool_call=ToolCall("mkdir", {"path": str(base / name)}),
+        final_prefix="Created the folder, sir.",
+        raw_match=m.group(0),
+    )
+
+
+_LIST_DESKTOP_RE = re.compile(
+    r"\b(?:list|show|what(?:'s|\s+is))\b.*\b(?:desktop|desktop\s+files)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_list_desktop(_m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="list_desktop",
+        tool_call=ToolCall("list_dir", {"path": str(_desktop_path()), "glob": "*", "recursive": False}),
+        final_prefix="Desktop scan complete, sir.",
+    )
+
+
+_SYSTEM_STATUS_RE = re.compile(
+    r"\b(?:system\s+status|pc\s+status|computer\s+status|diagnostics|how\s+is\s+(?:my\s+)?pc)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_system_status(_m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="system_status",
+        tool_call=ToolCall("system_status", {}),
+        final_prefix="System status, sir.",
+    )
+
+
+_SCREENSHOT_BROWSER_RE = re.compile(
+    r"\b(?:screenshot|screen\s+shot|capture)\b.*\b(?:browser|page|website)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_browser_screenshot(_m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="browser_screenshot",
+        tool_call=ToolCall("browser_screenshot", {"full_page": False}),
+        final_prefix="Browser screenshot captured, sir.",
+    )
+
+
+_AGENT_BACKEND_RE = re.compile(
+    r"^\s*(?P<prefix>"
+    r"(?:use|ask|run|delegate(?:\s+to)?)\s+"
+    r"(?:claude(?:\s+code)?|codex|opencode|open\s+code|agent\s+backend|backend)\s+"
+    r"(?:to\s+)?"
+    r"|"
+    r"(?:run|work|keep\s+going)\s+until\s+"
+    r"(?:you\s+)?(?:accomplish|finish|complete)\s+"
+    r"(?:the\s+)?(?:goal|task)\s*:?\s*"
+    r")(?P<goal>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _build_agent_backend(m: re.Match) -> IntentMatch | None:
+    goal = m.group("goal").strip()
+    if not goal:
+        return None
+    prefix = (m.group("prefix") or "").lower()
+    if "claude" in prefix:
+        backend = "claude"
+    elif "codex" in prefix:
+        backend = "codex"
+    elif "opencode" in prefix or "open code" in prefix:
+        backend = "opencode"
+    else:
+        backend = "auto"
+    return IntentMatch(
+        name="agent_backend",
+        tool_call=ToolCall("agent_backend_run", {
+            "goal": goal, "backend": backend, "cwd": str(Path.cwd()),
+            "max_turns": 20, "timeout": 1800,
+        }),
+        final_prefix="Agent backend run complete, sir.",
+    )
+
+
+# === Browser navigation â€” LOW PRIORITY (last among URL/search). ===
+# Critical: ONLY fires for explicit "open / go to / navigate to <something
+# URL-shaped>". Never for "open inline" (handled above) or "open the latest
+# news" (handled by web_search above).
+_OPEN_BROWSER_RE = re.compile(
+    r"^\s*(?:open|go\s+to|navigate\s+to|visit)\s+(?:my\s+|the\s+)?(?:browser\s+(?:to\s+)?)?(?P<target>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _build_open_browser(m: re.Match) -> IntentMatch | None:
+    target = (m.group("target") or "").strip()
+    if not _looks_like_url(target):
+        return None
+    return IntentMatch(
+        name="open_browser",
+        tool_call=ToolCall("browser_open", {"url": target}),
+        final_prefix="Browser navigation complete, sir.",
+    )
+
+
+_RUN_PS_RE = re.compile(
+    r"^\s*(?:run|execute)\s+(?:powershell|ps)\s*:?\s*(?P<command>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _build_run_ps(m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="run_powershell",
+        tool_call=ToolCall("run_powershell", {"command": m.group("command").strip()}),
+        final_prefix="PowerShell command complete, sir.",
+    )
+
+
+_RUN_CMD_RE = re.compile(
+    r"^\s*(?:run|execute)\s+(?:command|cmd|shell)\s*:?\s*(?P<command>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _build_run_cmd(m: re.Match) -> IntentMatch | None:
+    return IntentMatch(
+        name="run_shell",
+        tool_call=ToolCall("run_shell", {"command": m.group("command").strip()}),
+        final_prefix="Command complete, sir.",
+    )
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ master ordering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# First match wins. Media / search intents intentionally come BEFORE
+# browser_open so "show me news about X" never opens a visible browser.
+
+INTENTS: list[Intent] = [
+    Intent("text_to_3d",         _TEXT_TO_3D_RE,         _build_text_to_3d,
+           "Generate a 3D model from a text prompt."),
+    Intent("image_generate",     _IMAGE_GEN_RE,          _build_image_gen,
+           "Generate an image locally via FLUX.2-klein-4B."),
+    Intent("image_search",       _IMAGE_SEARCH_RE,       _build_image_search,
+           "Image grid for visual queries."),
+    Intent("video_search",       _VIDEO_SEARCH_RE,       _build_video_search,
+           "YouTube embed for video queries."),
+    Intent("web_search_news",    _NEWS_BARE_RE,          _build_news_bare,
+           "General latest-headlines search (no topic given)."),
+    Intent("web_search",         _WEB_SEARCH_RE,         _build_web_search,
+           "Web result cards in the Media Bay."),
+    Intent("open_inline",        _OPEN_INLINE_RE,        _build_open_inline,
+           "Embed a known URL inline."),
+    Intent("memory_galaxy",      _MEMORY_GALAXY_RE,      _build_memory_galaxy,
+           "Surface the neural memory cloud."),
+    Intent("webcam_see",         _WEBCAM_SEE_RE,         _build_webcam_see,
+           "One-shot webcam + vision analysis."),
+    Intent("create_folder",      _CREATE_FOLDER_RE,      _build_create_folder,
+           "Create a folder on the file system."),
+    Intent("list_desktop",       _LIST_DESKTOP_RE,       _build_list_desktop,
+           "List Desktop contents."),
+    Intent("system_status",      _SYSTEM_STATUS_RE,      _build_system_status,
+           "Live system telemetry."),
+    Intent("browser_screenshot", _SCREENSHOT_BROWSER_RE, _build_browser_screenshot,
+           "Screenshot of the controlled browser."),
+    Intent("agent_backend",      _AGENT_BACKEND_RE,      _build_agent_backend,
+           "Delegate goal to claude-code / codex / opencode."),
+    Intent("open_browser",       _OPEN_BROWSER_RE,       _build_open_browser,
+           "Last-resort browser navigation for explicit URL targets."),
+    Intent("run_powershell",     _RUN_PS_RE,             _build_run_ps,
+           "Run a PowerShell command."),
+    Intent("run_shell",          _RUN_CMD_RE,            _build_run_cmd,
+           "Run a generic shell command."),
+]
+
+
+def classify(user_text: str) -> IntentMatch | None:
+    """Run the intent catalogue against `user_text`. First match wins.
+
+    Returns the IntentMatch (or None). Always logs the result so the
+    operator can diagnose tool routing.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return None
+    for intent in INTENTS:
+        m = intent.pattern.search(text)
+        if not m:
+            continue
+        built = intent.builder(m)
+        if built is None:
+            log.debug("intent '%s' matched but builder rejected: %s", intent.name, text[:80])
+            continue
+        log.info(
+            "intent='%s' tool='%s' args=%s match=%r",
+            built.name, built.tool_call.name, built.tool_call.args, built.raw_match[:80],
+        )
+        return built
+    log.debug("no intent matched: %s", text[:80])
+    return None
+
+
+# Strong segment boundaries for compound requests. Newlines, semicolons, and
+# numbered/bulleted list markers always split.
+_SEGMENT_SPLIT_RE = re.compile(
+    r"(?:\r?\n)+|\s*;\s*|(?:^|\s)\d{1,2}[:.)]\s+|(?:^|\s)[-*â€¢]\s+"
+)
+# Leftover leading list marker on a segment (e.g. "1:list" with no space after
+# the colon survives the split above) â€” strip it so classify() sees clean text.
+_LEAD_MARKER_RE = re.compile(r"^\s*(?:\d{1,2}\s*[:.)]|[-*â€¢])\s*")
+
+# Command verbs that mark the start of a fresh instruction.
+_CMD_VERB = (
+    r"(?:show|find|get|grab|give|generate|make|create|draw|render|search|"
+    r"play|queue|open|populate|pull|bring|look|tell|fetch|download|display|"
+    r"list|put|what'?s?|what\s+is)"
+)
+# Soft conjunction boundary â€” " and " / " then " / " and then " / "& " / ", and ".
+# Split ONLY when the next clause starts with a command verb, so connective
+# prose ("cats and dogs", "hotels and restaurants in cairo") is never split.
+# The leading (\s+|\s*,\s*) requires a real separator so "command"/"lengthen"
+# can't false-match the embedded "and"/"then".
+_CONJ_SPLIT_RE = re.compile(
+    rf"(?:\s+|\s*,\s*)(?:and\s+then|and|then|&)\s+(?={_CMD_VERB}\b)",
+    re.IGNORECASE,
+)
+
+
+def _split_segments(text: str) -> list[str]:
+    out: list[str] = []
+    for part in _SEGMENT_SPLIT_RE.split(text):
+        if not part:
+            continue
+        for sub in _CONJ_SPLIT_RE.split(part):
+            if not sub:
+                continue
+            cleaned = _LEAD_MARKER_RE.sub("", sub).strip(" .\t\r\n")
+            if len(cleaned) >= 3:
+                out.append(cleaned)
+    return out
+
+
+def classify_multi(user_text: str) -> list[IntentMatch] | None:
+    """Decompose a COMPOUND request into multiple deterministic intents.
+
+    Splits on strong boundaries (newlines / numbered or bulleted markers /
+    semicolons), classifies each segment independently, and returns the list
+    of matches when 2+ segments resolve to an intent. Returns None for a
+    single command so the caller falls back to single-intent classify().
+
+    This is what lets "1: search jobs  2: make an image  3: find videos" fan
+    out through the swarm instead of only the first matching intent firing.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return None
+    segments = _split_segments(text)
+    if len(segments) < 2:
+        return None
+    matches: list[IntentMatch] = []
+    for seg in segments:
+        m = classify(seg)
+        if m is not None:
+            matches.append(m)
+    if len(matches) < 2:
+        return None
+    log.info(
+        "multi-intent: %d segments â†’ %d intents (%s)",
+        len(segments), len(matches), ", ".join(m.name for m in matches),
+    )
+    return matches
+
+
+def list_intents() -> list[dict]:
+    """Useful for /api/intents and UI surface."""
+    return [
+        {"name": i.name, "pattern": i.pattern.pattern, "description": i.description}
+        for i in INTENTS
+    ]
+
+========== jarvis\config.py ==========
+
+"""Configuration loader.
+
+Reads config.yaml from the project root, merges in environment variables
+from .env, validates with Pydantic, and exposes a typed Config object.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import yaml
+from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+
+
+class ModelConfig(BaseModel):
+    provider: str = "openai_compatible"
+    endpoint: str = "http://localhost:1234/v1"
+    model: str = "local-model"
+    api_key_env: str = "LLM_API_KEY"
+    temperature: float = 0.3
+    max_tokens: int = 4096
+    request_timeout_seconds: int = 120
+    native_tool_calls: bool = False
+    reasoning_effort: str | None = None
+    frequency_penalty: float = 0.2
+    presence_penalty: float = 0.0
+    repeat_penalty: float = 1.0
+
+    @property
+    def api_key(self) -> str:
+        return os.environ.get(self.api_key_env, "")
+
+
+class ImageModelConfig(BaseModel):
+    selected: str = "flux2-klein"
+
+
+class PermissionsConfig(BaseModel):
+    mode: str = "confirm"
+    denylist: list[str] = Field(default_factory=list)
+
+
+class UIConfig(BaseModel):
+    theme: str = "jarvis"
+    emoji: bool = True
+    show_status_bar: bool = True
+    refresh_interval_ms: int = 1500
+
+
+class MemoryConfig(BaseModel):
+    db_path: str = "data/memory.db"
+    auto_remember_user_preferences: bool = True
+
+
+class LoggingConfig(BaseModel):
+    level: str = "INFO"
+    file: str = "data/logs/jarvis.log"
+    action_log: str = "data/logs/actions.jsonl"
+
+
+class BackupConfig(BaseModel):
+    enabled: bool = True
+    dir: str = "data/backups"
+    keep_last: int = 50
+
+
+class CodeExecConfig(BaseModel):
+    max_retries: int = 3
+    timeout_seconds: int = 60
+    workdir: str = "data/sandbox"
+    allowed_runtimes: list[str] = Field(
+        default_factory=lambda: ["python", "node"]
+    )
+
+
+class ProjectConfig(BaseModel):
+    watch_dirs: list[str] = Field(default_factory=list)
+    ignore_patterns: list[str] = Field(default_factory=list)
+
+
+class PluginToggle(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    enabled: bool = False
+    provider: str | None = None
+
+
+class AssistantConfig(BaseModel):
+    name: str = "JARVIS"
+    persona: str = (
+        "You are JARVIS, a calm, precise, proactive local AI assistant."
+    )
+
+
+class MissionConfig(BaseModel):
+    enabled: bool = False
+    project_path: str = ""
+
+
+class UltimateConfig(BaseModel):
+    """Master switch and per-feature toggles for the ULTIMATE upgrade."""
+
+    enabled: bool = True
+
+    # Intelligence
+    semantic_memory: bool = True
+    embed_model: str = "text-embedding-3-small"
+    embed_endpoint: str = ""
+    recall_k: int = 5
+    recall_min_score: float = 0.22
+    auto_remember: bool = True
+    context_compaction: bool = True
+    compaction_trigger_messages: int = 28
+    compaction_keep_recent: int = 12
+    autonomous_planning: bool = True
+    plan_min_chars: int = 60
+
+    # Proactive features
+    proactive_suggestions: bool = True
+
+    # Frontend visual features
+    reactive_visuals: bool = True
+
+
+class VoiceMapConfig(BaseModel):
+    local: str = "none"  # piper | sapi | none
+    local_voice: str = ""
+    online: str = "edge"
+    online_voice: str = ""
+    lang_tag: str = ""
+    riva_voice: str = ""
+    riva_language_code: str = ""
+
+
+class LanguagesConfig(BaseModel):
+    """Multilingual speech recognition and voice settings."""
+
+    enabled: list[str] = Field(
+        default_factory=lambda: ["en", "ta", "hi"]
+    )
+    auto_detect: bool = True
+    default: str = "en"
+    stt_language: str = "auto"  # auto | en | ta | hi
+    persist_preference: bool = True
+    detect_min_confidence: float = 0.45
+    fallback_language: str = "en"
+    online_tts_allowed: bool = True
+    tts_timeout_seconds: int = 45
+    stt_timeout_seconds: int = 60
+    fallback_on_tts_failure: bool = True
+    voices: dict[str, VoiceMapConfig] = Field(default_factory=dict)
+
+
+class VoiceConfig(BaseModel):
+    wake_word: str = "Hey JARVIS"
+
+    @field_validator("wake_word")
+    @classmethod
+    def normalize_wake_word(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("wake_word must not be blank")
+        return value
+
+    provider: str = "auto"  # auto | piper | edge_tts | nvidia_riva
+    edge_voice: str = "en-GB-ThomasNeural"
+    edge_rate: str = "-6%"
+    edge_pitch: str = "+0Hz"
+
+    # Piper voice
+    piper_enabled: bool = False
+    piper_model: str = "data/voices/jarvis.onnx"
+    piper_speaker: int = 0
+    piper_length_scale: float = 1.32
+    piper_noise_scale: float = 0.55
+    piper_noise_w_scale: float = 0.72
+    piper_volume: float = 1.15
+
+    # NVIDIA Riva voice
+    riva_enabled: bool = False
+    riva_server: str = "localhost:50051"
+    riva_voice: str = "English-US.Female-1"
+    riva_language_code: str = "en-US"
+    riva_sample_rate_hz: int = 44100
+    nvidia_waveglow_model_url: str = (
+        "https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tlt-jarvis/"
+        "models/speechsynthesis_waveglow?version=deployable_v1.0"
+    )
+
+    languages: LanguagesConfig = Field(default_factory=LanguagesConfig)
+
+
+class Config(BaseModel):
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        protected_namespaces=(),
+    )
+
+    A: AssistantConfig = Field(default_factory=AssistantConfig)
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    image_model: ImageModelConfig = Field(
+        default_factory=ImageModelConfig
+    )
+    permissions: PermissionsConfig = Field(
+        default_factory=PermissionsConfig
+    )
+    ui: UIConfig = Field(default_factory=UIConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    backups: BackupConfig = Field(default_factory=BackupConfig)
+    code_execution: CodeExecConfig = Field(
+        default_factory=CodeExecConfig
+    )
+    project: ProjectConfig = Field(default_factory=ProjectConfig)
+    plugins: dict[str, PluginToggle] = Field(default_factory=dict)
+    agents: dict[str, PluginToggle] = Field(default_factory=dict)
+    mission: MissionConfig = Field(default_factory=MissionConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    ultimate: UltimateConfig = Field(default_factory=UltimateConfig)
+
+    project_root: Path = PROJECT_ROOT
+
+    def abs_path(self, rel: str) -> Path:
+        p = Path(rel)
+        return p if p.is_absolute() else self.project_root / p
+
+
+def _deep_merge(
+    base: dict[str, Any],
+    override: dict[str, Any],
+) -> dict[str, Any]:
+    out = dict(base)
+
+    for key, value in override.items():
+        if (
+            key in out
+            and isinstance(out[key], dict)
+            and isinstance(value, dict)
+        ):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+
+    return out
+
+
+def load_config(path: Path | None = None) -> Config:
+    if DEFAULT_ENV_PATH.exists():
+        load_dotenv(DEFAULT_ENV_PATH)
+
+    cfg_path = path or DEFAULT_CONFIG_PATH
+
+    if not cfg_path.exists():
+        return Config()
+
+    with cfg_path.open("r", encoding="utf-8") as file:
+        raw = yaml.safe_load(file) or {}
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Configuration file must contain a YAML mapping: {cfg_path}"
+        )
+
+    return Config(**raw)
+
+========== jarvis\agents\research.py ==========
+from .base import Agent
+
+
+class ResearchAgent(Agent):
+    def __init__(self) -> None:
+        super().__init__(
+            name="research",
+            description="Searches and summarises web sources.",
+            system_prompt=(
+                "You are the RESEARCH agent. Prefer web_search then web_fetch "
+                "to read promising pages. Quote sources with their URL. "
+                "Summarise findings in tight bullets. Never invent URLs."
+            ),
+            tool_allowlist=["web_search", "web_fetch", "remember", "add_note", "search_memory"],
+        )

@@ -1,0 +1,9 @@
+multilingual_config:
+  enabled: true
+  auto_detect_language: true
+  default_language: "en"
+  default_gender: "female"
+  fallback_voice: "en-GB-ThomasNeural"
+  stt_engine: "faster-whisper"
+  stt_model_size: "base"
+  stt_device: "cpu"
