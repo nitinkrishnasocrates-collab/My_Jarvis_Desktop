@@ -797,4 +797,4 @@ licenses.
 
 *Built iteratively with a focus on voice-first interaction, modular AI
 capabilities, and a distinctive desktop experience.*
-:::
+:::      and added Gnani AI also inside
